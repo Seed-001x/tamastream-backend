@@ -1,5 +1,5 @@
-// src/db/schema.sql — Tamastream base schema (idempotent).
-// Pets are Tamagotchi companions bonded to pump.fun tokens.
+-- 001_ensure_tables.sql — Tamastream base schema (idempotent).
+-- Pets are Tamagotchi companions bonded to pump.fun tokens.
 
 -- ---------------------------------------------------------------- users
 CREATE TABLE IF NOT EXISTS users (
