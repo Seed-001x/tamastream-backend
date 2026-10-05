@@ -356,9 +356,28 @@ export function registerPetRoutes(app, { pool, rpcConnection, requireAuth }) {
       }
 
       // Verify the mint now exists before recording.
-      const mintInfo = await conn.getAccountInfo(mintPk, 'confirmed');
-      if (!mintInfo) {
+      // RPC nodes can lag right after submit — retry with backoff, and fall
+      // back to the transaction's confirmation status (if the tx landed, the
+      // mint must exist; the account may just not be visible yet).
+      let mintInfo = null;
+      let txConfirmed = false;
+      for (let i = 0; i < 10; i++) {
+        try {
+          mintInfo = await conn.getAccountInfo(mintPk, 'confirmed');
+        } catch { /* retry */ }
+        if (mintInfo) break;
+        try {
+          const st = await conn.getSignatureStatus(signature);
+          const cs = st && st.value && st.value.confirmationStatus;
+          if (cs === 'confirmed' || cs === 'finalized') txConfirmed = true;
+        } catch { /* retry */ }
+        await new Promise((r) => setTimeout(r, 2000));
+      }
+      if (!mintInfo && !txConfirmed) {
         return res.status(400).json({ error: 'mint not found on-chain after submit (tx may have failed)' });
+      }
+      if (!mintInfo && txConfirmed) {
+        console.warn('[pets] tx confirmed but mint account not yet visible; recording anyway:', mint);
       }
 
       const imageUrl = intent.image_url || null;
@@ -403,6 +422,75 @@ export function registerPetRoutes(app, { pool, rpcConnection, requireAuth }) {
     } catch (e) {
       console.error('[pets] submit failed:', e.message);
       res.status(500).json({ error: 'submit failed', detail: e.message });
+    }
+  });
+
+  // Recover a launch whose tx landed but whose pet record was never written
+  // (e.g. the post-submit verification flaked on RPC lag). Auth: launcher only.
+  app.post('/pets/launch/recover', requireAuth, async (req, res) => {
+    try {
+      const conn = await rpcConnection();
+      if (!conn) return res.status(503).json({ error: 'RPC unavailable' });
+      const { mint } = req.body || {};
+      if (!isPubkey(mint)) return res.status(400).json({ error: 'mint is required' });
+
+      const { rows: existing } = await pool.query('SELECT mint FROM pets WHERE mint = $1', [mint]);
+      if (existing.length) return res.json({ data: { mint, recovered: false, reason: 'already recorded' } });
+
+      const { rows: intents } = await pool.query(
+        'SELECT * FROM launch_intents WHERE mint = $1',
+        [mint]
+      );
+      if (!intents.length) return res.status(404).json({ error: 'no launch intent for this mint' });
+      const intent = intents[0];
+      if (intent.launcher_wallet !== req.auth.pubkey) {
+        return res.status(403).json({ error: 'intent belongs to a different wallet' });
+      }
+
+      // Confirm the mint actually exists on-chain (retry for RPC lag).
+      const mintPk = new PublicKey(mint);
+      let mintInfo = null;
+      for (let i = 0; i < 10 && !mintInfo; i++) {
+        try { mintInfo = await conn.getAccountInfo(mintPk, 'confirmed'); } catch { /* retry */ }
+        if (!mintInfo) await new Promise((r) => setTimeout(r, 2000));
+      }
+      if (!mintInfo) return res.status(400).json({ error: 'mint not found on-chain' });
+
+      const imageUrl = intent.image_url || null;
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        await client.query(
+          `INSERT INTO pets (mint, name, ticker, traits, bio, image_url, creator_wallet,
+                             launch_signature, pet_wallet_pubkey, pet_wallet_encrypted)
+           VALUES ($1,$2,$3,$4::jsonb,$5,$6,$7,$8,$9,$10)
+           ON CONFLICT (mint) DO NOTHING`,
+          [
+            mint, intent.name, intent.symbol,
+            JSON.stringify(intent.traits || []),
+            intent.bio || '', imageUrl,
+            intent.launcher_wallet, intent.launch_signature || null,
+            intent.pet_wallet_pubkey || null,
+            intent.pet_wallet_encrypted || null,
+          ]
+        );
+        await client.query(
+          `INSERT INTO watched_mints (mint, origin, active) VALUES ($1,'TAMASTREAM',true)
+           ON CONFLICT (mint) DO UPDATE SET active = true, origin = 'TAMASTREAM'`,
+          [mint]
+        );
+        await client.query('DELETE FROM launch_intents WHERE mint = $1', [mint]);
+        await client.query('COMMIT');
+      } catch (e) {
+        await client.query('ROLLBACK');
+        throw e;
+      } finally {
+        client.release();
+      }
+      res.json({ data: { mint, recovered: true } });
+    } catch (e) {
+      console.error('[pets] recover failed:', e.message);
+      res.status(500).json({ error: 'recover failed', detail: e.message });
     }
   });
 
