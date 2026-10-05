@@ -509,6 +509,77 @@ export function registerPetRoutes(app, { pool, rpcConnection, requireAuth }) {
     }
   });
 
+  // Import a coin launched directly on pump.fun as a Tamastream pet.
+  // Takes a mint (CA); verifies it on-chain, pulls name/symbol/image from
+  // pump.fun metadata when not supplied, generates the pet's own wallet
+  // (user funds it manually — fees are NOT auto-routed for imports).
+  app.post('/pets/launch/import', requireAuth, async (req, res) => {
+    try {
+      const conn = await rpcConnection();
+      if (!conn) return res.status(503).json({ error: 'RPC unavailable' });
+      const { mint, name, ticker, traits, bio, image_url } = req.body || {};
+      if (!isPubkey(mint)) return res.status(400).json({ error: 'mint (CA) is required' });
+
+      const { rows: existing } = await pool.query('SELECT mint FROM pets WHERE mint = $1', [mint]);
+      if (existing.length) return res.status(409).json({ error: 'this coin is already a pet' });
+
+      // Verify the mint exists on-chain (retry for RPC lag).
+      const mintPk = new PublicKey(mint);
+      let mintInfo = null;
+      for (let i = 0; i < 8 && !mintInfo; i++) {
+        try { mintInfo = await conn.getAccountInfo(mintPk, 'confirmed'); } catch { /* retry */ }
+        if (!mintInfo) await new Promise((r) => setTimeout(r, 1500));
+      }
+      if (!mintInfo) return res.status(400).json({ error: 'mint not found on-chain' });
+
+      // Pull token metadata from pump.fun when the caller didn't supply it.
+      let meta = {};
+      try {
+        const r = await fetch(`https://frontend-api.pump.fun/coins/${mint}`, { signal: AbortSignal.timeout(10000) });
+        if (r.ok) meta = await r.json();
+      } catch { /* fall back to supplied values */ }
+
+      const petName = (name || meta.name || 'Nameless').toString().slice(0, 24);
+      const petTicker = (ticker || meta.symbol || 'PET').toString().toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 10) || 'PET';
+      const petBio = (bio ?? meta.description ?? '').toString().slice(0, 280);
+      const petTraits = Array.isArray(traits) && traits.length ? traits.slice(0, 3) : ['Hyper'];
+      const petImage = image_url || meta.image_uri || null;
+
+      const petWallet = generatePetWallet();
+
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        await client.query(
+          `INSERT INTO pets (mint, name, ticker, traits, bio, image_url, creator_wallet,
+                             launch_signature, pet_wallet_pubkey, pet_wallet_encrypted)
+           VALUES ($1,$2,$3,$4::jsonb,$5,$6,$7,$8,$9,$10)
+           ON CONFLICT (mint) DO NOTHING`,
+          [
+            mint, petName, petTicker, JSON.stringify(petTraits), petBio, petImage,
+            req.auth.pubkey, null,
+            petWallet.pubkey, petWallet.encryptedSecret,
+          ]
+        );
+        await client.query(
+          `INSERT INTO watched_mints (mint, origin, active) VALUES ($1,'TAMASTREAM',true)
+           ON CONFLICT (mint) DO UPDATE SET active = true, origin = 'TAMASTREAM'`,
+          [mint]
+        );
+        await client.query('COMMIT');
+      } catch (e) {
+        await client.query('ROLLBACK');
+        throw e;
+      } finally {
+        client.release();
+      }
+      res.json({ data: { mint, name: petName, ticker: petTicker, petWallet: petWallet.pubkey, image: petImage } });
+    } catch (e) {
+      console.error('[pets] import failed:', e.message);
+      res.status(500).json({ error: 'import failed', detail: e.message });
+    }
+  });
+
   // ---------------------------------------------------------------- trading
 
   // Trade history (public). Last 20 trades for a pet.
