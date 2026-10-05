@@ -32,7 +32,25 @@ import {
   ComputeBudgetProgram,
 } from '@solana/web3.js';
 import BN from 'bn.js';
-import { generatePetWallet } from '../wallet/petWallet.js';
+import { generatePetWallet, decryptPetWallet } from '../wallet/petWallet.js';
+import { getQuote, executeSwap, SOL_MINT } from '../trading/jupiter.js';
+import { chatWithPet } from '../ai/petChat.js';
+
+// Simple in-memory rate limiter: max 30 AI chats per pet per hour.
+const chatBuckets = new Map(); // mint -> [timestamps]
+function chatRateOk(mint) {
+  const now = Date.now();
+  const windowMs = 60 * 60 * 1000;
+  let hits = chatBuckets.get(mint) || [];
+  hits = hits.filter((t) => now - t < windowMs);
+  if (hits.length >= 30) {
+    chatBuckets.set(mint, hits);
+    return false;
+  }
+  hits.push(now);
+  chatBuckets.set(mint, hits);
+  return true;
+}
 
 function isPubkey(s) {
   try {
@@ -385,6 +403,151 @@ export function registerPetRoutes(app, { pool, rpcConnection, requireAuth }) {
     } catch (e) {
       console.error('[pets] submit failed:', e.message);
       res.status(500).json({ error: 'submit failed', detail: e.message });
+    }
+  });
+
+  // ---------------------------------------------------------------- trading
+
+  // Trade history (public). Last 20 trades for a pet.
+  app.get('/pets/:mint/trades', async (req, res) => {
+    try {
+      const { rows } = await pool.query(
+        `SELECT id, pet_mint, action, input_mint, output_mint,
+                input_amount_lamports, output_amount_approx, signature, created_at
+         FROM pet_trades WHERE pet_mint = $1 ORDER BY created_at DESC LIMIT 20`,
+        [req.params.mint]
+      );
+      res.json({ data: rows });
+    } catch (e) {
+      res.status(500).json({ error: 'failed to fetch trades', detail: e.message });
+    }
+  });
+
+  // Execute a trade with the pet's own wallet (auth — launcher only).
+  // Body: { action: 'buy', tokenMint, amountSol }.
+  // Conservative: SOL -> token buys only, 0.5 SOL max per trade,
+  // max 5 trades per pet per hour.
+  app.post('/pets/:mint/trade', requireAuth, async (req, res) => {
+    try {
+      const conn = await rpcConnection();
+      if (!conn) return res.status(503).json({ error: 'RPC unavailable' });
+
+      const { action, tokenMint, amountSol } = req.body || {};
+      if (action !== 'buy') {
+        return res.status(400).json({ error: "action must be 'buy' (sells coming later)" });
+      }
+      if (!isPubkey(tokenMint)) {
+        return res.status(400).json({ error: 'invalid tokenMint' });
+      }
+      const amt = Number(amountSol);
+      if (!Number.isFinite(amt) || amt < 0.001 || amt > 0.5) {
+        return res.status(400).json({ error: 'amountSol must be between 0.001 and 0.5' });
+      }
+
+      // Pet must exist, have a wallet, and the caller must be the launcher.
+      const { rows } = await pool.query(
+        `SELECT mint, creator_wallet, pet_wallet_pubkey, pet_wallet_encrypted
+         FROM pets WHERE mint = $1`,
+        [req.params.mint]
+      );
+      if (!rows.length) return res.status(404).json({ error: 'pet not found' });
+      const pet = rows[0];
+      if (pet.creator_wallet !== req.auth.pubkey) {
+        return res.status(403).json({ error: 'only the pet launcher can trigger trades' });
+      }
+      if (!pet.pet_wallet_pubkey || !pet.pet_wallet_encrypted) {
+        return res.status(400).json({ error: 'this pet has no wallet yet' });
+      }
+
+      // Rate limit: max 5 trades per pet per hour.
+      const { rows: recent } = await pool.query(
+        `SELECT COUNT(*)::int AS n FROM pet_trades
+         WHERE pet_mint = $1 AND created_at > now() - interval '1 hour'`,
+        [req.params.mint]
+      );
+      if (recent[0].n >= 5) {
+        return res.status(429).json({ error: 'trade rate limit: max 5 trades per hour per pet' });
+      }
+
+      // Balance check: need amount + 0.01 SOL buffer for fees/rent.
+      const petKeypair = decryptPetWallet(pet.pet_wallet_encrypted);
+      const balance = await conn.getBalance(petKeypair.publicKey);
+      const lamports = Math.floor(amt * 1e9);
+      if (balance < lamports + 0.01 * 1e9) {
+        return res.status(400).json({
+          error: 'insufficient pet wallet balance',
+          detail: `Pet wallet holds ${(balance / 1e9).toFixed(4)} SOL; needs ${amt} + 0.01 buffer.`,
+        });
+      }
+
+      // Quote + execute via Jupiter.
+      const quote = await getQuote(SOL_MINT, tokenMint, lamports, 100);
+      const { signature, outAmount } = await executeSwap(petKeypair, quote, conn);
+
+      await pool.query(
+        `INSERT INTO pet_trades
+           (pet_mint, action, input_mint, output_mint, input_amount_lamports,
+            output_amount_approx, signature)
+         VALUES ($1,'buy',$2,$3,$4,$5,$6)`,
+        [
+          req.params.mint, SOL_MINT, tokenMint, lamports,
+          outAmount ? BigInt(outAmount).toString() : null, signature,
+        ]
+      );
+
+      res.json({
+        data: {
+          signature,
+          inputAmountSol: amt,
+          outputMint: tokenMint,
+          outputAmountApprox: outAmount,
+          explorerUrl: `https://solscan.io/tx/${signature}`,
+        },
+      });
+    } catch (e) {
+      console.error('[pets] trade failed:', e.message);
+      res.status(500).json({ error: 'trade failed', detail: e.message });
+    }
+  });
+
+  // AI chat with the pet (auth). Conversational messages go to OpenAI;
+  // action commands (dance, sleep, ...) are handled client-side and never
+  // reach this endpoint.
+  // Body: { message, history: [{role: 'user'|'pet', text}], mood, market: {mcap, change24h} }.
+  // Returns { text, emoji }. Rate limited: 30 msgs / pet / hour.
+  app.post('/pets/:mint/chat', requireAuth, async (req, res) => {
+    try {
+      const { message, history, mood, market } = req.body || {};
+      if (typeof message !== 'string' || !message.trim()) {
+        return res.status(400).json({ error: 'message is required' });
+      }
+      if (message.length > 500) {
+        return res.status(400).json({ error: 'message too long (500 chars max)' });
+      }
+
+      const { rows } = await pool.query(
+        `SELECT name, ticker, traits FROM pets WHERE mint = $1`,
+        [req.params.mint]
+      );
+      if (!rows.length) return res.status(404).json({ error: 'pet not found' });
+      const pet = rows[0];
+
+      if (!chatRateOk(req.params.mint)) {
+        return res.status(429).json({ error: 'chat rate limit: max 30 AI messages per hour per pet' });
+      }
+
+      const reply = await chatWithPet({
+        pet: { name: pet.name, ticker: pet.ticker, traits: pet.traits || [] },
+        message,
+        history: Array.isArray(history) ? history.slice(-10) : [],
+        mood: typeof mood === 'string' ? mood : 'NEUTRAL',
+        market: market && typeof market === 'object' ? market : null,
+      });
+      res.json({ data: reply });
+    } catch (e) {
+      console.error('[pets] chat failed:', e.message);
+      const status = /not set|unavailable/i.test(e.message) ? 503 : 500;
+      res.status(status).json({ error: 'chat failed', detail: e.message });
     }
   });
 }
