@@ -425,6 +425,21 @@ export function registerPetRoutes(app, { pool, rpcConnection, requireAuth }) {
     }
   });
 
+  // List the caller's pending (unrecorded) launch intents so the UI can offer recovery.
+  app.get('/pets/launch/pending', requireAuth, async (req, res) => {
+    try {
+      const { rows } = await pool.query(
+        `SELECT mint, name, symbol, image_url, created_at
+         FROM launch_intents WHERE launcher_wallet = $1 AND expires_at > now()
+         ORDER BY created_at DESC`,
+        [req.auth.pubkey]
+      );
+      res.json({ data: rows });
+    } catch (e) {
+      res.status(500).json({ error: 'failed to list pending launches' });
+    }
+  });
+
   // Recover a launch whose tx landed but whose pet record was never written
   // (e.g. the post-submit verification flaked on RPC lag). Auth: launcher only.
   app.post('/pets/launch/recover', requireAuth, async (req, res) => {
