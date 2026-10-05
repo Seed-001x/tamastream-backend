@@ -7,6 +7,16 @@ import { registerPetRoutes } from './pets.js';
 const PORT = Number(process.env.PORT || 3000);
 
 const app = express();
+
+// CORS — allow the frontend to call the API from browsers.
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
 app.use(express.json({ limit: '10mb' })); // pet portraits ride as base64 data URLs
 
 // Express 4 does not catch errors thrown in async route handlers — wrap every
