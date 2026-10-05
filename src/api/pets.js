@@ -3,17 +3,22 @@
 // Flow:
 //   1. POST /pets/upload         (auth) — pet portrait PNG -> pump.fun IPFS
 //      -> metadata JSON -> IPFS. Returns { imageUri, metadataUri }.
-//   2. POST /pets/launch/prepare (auth) — validates params and builds an
-//      UNSIGNED v0 transaction (pump create_v2). The client signs it with
+//   2. POST /pets/launch/prepare (auth) — validates params, generates the
+//      pet's own Solana wallet (encrypted at rest), and builds an UNSIGNED
+//      v0 transaction (pump create_v2) with the pet wallet as `creator`
+//      (so all creator fees flow to the pet). The client signs it with
 //      the user's wallet AND the client-generated mint keypair, then POSTs
-//      the signed bytes to /submit. The backend never holds keys.
+//      the signed bytes to /submit. The backend never holds USER keys.
 //   3. POST /pets/launch/submit  (auth) — sends the signed tx via the
 //      backend's RPC, confirms, then inserts the pet row and adds the mint
 //      to watched_mints. Returns { mint, signature }.
 //
 // Boundaries:
-//   * creator is the launcher's own wallet (they keep their creator fees).
-//     TODO: route creator fees to a platform wallet when monetization lands.
+//   * creator is the PET's own wallet (auto-generated at prepare time). ALL of
+//     the coin's creator fees flow to the pet's wallet by pump.fun protocol —
+//     the launcher does nothing extra; they just sign the same transaction.
+//     The backend holds the pet's encrypted key (WALLET_ENCRYPTION_KEY);
+//     private material is NEVER logged or returned to clients.
 //   * 10mb JSON body limit: pet portraits are phone photos as base64.
 
 import {
@@ -27,6 +32,7 @@ import {
   ComputeBudgetProgram,
 } from '@solana/web3.js';
 import BN from 'bn.js';
+import { generatePetWallet } from '../wallet/petWallet.js';
 
 function isPubkey(s) {
   try {
@@ -97,6 +103,39 @@ export function registerPetRoutes(app, { pool, rpcConnection, requireAuth }) {
       res.json({ data: rows[0] });
     } catch (e) {
       res.status(500).json({ error: 'failed to fetch pet', detail: e.message });
+    }
+  });
+
+  // Pet wallet (public). Returns the pet's own Solana wallet address and SOL
+  // balance. NEVER exposes private key material.
+  app.get('/pets/:mint/wallet', async (req, res) => {
+    try {
+      const { rows } = await pool.query(
+        'SELECT pet_wallet_pubkey FROM pets WHERE mint = $1',
+        [req.params.mint]
+      );
+      if (!rows.length) return res.status(404).json({ error: 'pet not found' });
+      const pubkey = rows[0].pet_wallet_pubkey || null;
+      if (!pubkey) return res.json({ data: { pubkey: null, balanceSol: null, balanceLamports: null } });
+
+      let balanceLamports = null;
+      try {
+        const conn = await rpcConnection();
+        if (conn && isPubkey(pubkey)) {
+          balanceLamports = await conn.getBalance(new PublicKey(pubkey));
+        }
+      } catch {
+        // balance unavailable — still return the pubkey
+      }
+      res.json({
+        data: {
+          pubkey,
+          balanceLamports,
+          balanceSol: balanceLamports == null ? null : balanceLamports / 1e9,
+        },
+      });
+    } catch (e) {
+      res.status(500).json({ error: 'failed to fetch pet wallet', detail: e.message });
     }
   });
 
@@ -172,13 +211,27 @@ export function registerPetRoutes(app, { pool, rpcConnection, requireAuth }) {
         });
       }
 
-      // Creator = the launcher (they keep their own creator fees).
+      // Generate the pet's own wallet. It becomes the coin's `creator`, so
+      // ALL creator fees flow to the pet automatically (pump.fun protocol).
+      // The launcher does nothing extra — they just sign as usual.
+      let petWallet;
+      try {
+        petWallet = generatePetWallet();
+      } catch (e) {
+        console.error('[pets] pet wallet generation failed:', e.message);
+        return res.status(500).json({
+          error: 'pet wallet unavailable',
+          detail: e.message,
+        });
+      }
+      const petCreator = new PublicKey(petWallet.pubkey);
+
       const createIx = await PUMP_SDK.createV2Instruction({
         mint: new PublicKey(mintStr),
         name,
         symbol,
         uri: metadataUri,
-        creator: launcher,
+        creator: petCreator,
         user: launcher,
         mayhemMode: false,
         creatorFeeBps: new BN(0),
@@ -200,17 +253,22 @@ export function registerPetRoutes(app, { pool, rpcConnection, requireAuth }) {
 
       await pool.query(
         `INSERT INTO launch_intents (mint, user_id, launcher_wallet, name, symbol,
-                                     metadata_uri, traits, bio, expires_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8, now() + interval '24 hours')
+                                     metadata_uri, traits, bio,
+                                     pet_wallet_pubkey, pet_wallet_encrypted,
+                                     expires_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10, now() + interval '24 hours')
          ON CONFLICT (mint) DO UPDATE SET
            user_id = EXCLUDED.user_id, launcher_wallet = EXCLUDED.launcher_wallet,
            name = EXCLUDED.name, symbol = EXCLUDED.symbol,
            metadata_uri = EXCLUDED.metadata_uri,
            traits = EXCLUDED.traits, bio = EXCLUDED.bio,
+           pet_wallet_pubkey = EXCLUDED.pet_wallet_pubkey,
+           pet_wallet_encrypted = EXCLUDED.pet_wallet_encrypted,
            created_at = now(), expires_at = now() + interval '24 hours'`,
         [
           mintStr, req.auth.sub, req.auth.pubkey, name, symbol, metadataUri,
           JSON.stringify(traits), bio,
+          petWallet.pubkey, petWallet.encryptedSecret,
         ]
       );
 
@@ -220,7 +278,8 @@ export function registerPetRoutes(app, { pool, rpcConnection, requireAuth }) {
         [mintStr, imageUri || null]
       );
 
-      res.json({ data: { txBase64, mint: mintStr } });
+      // Return the pet wallet pubkey only — NEVER the encrypted secret.
+      res.json({ data: { txBase64, mint: mintStr, petWallet: petWallet.pubkey } });
     } catch (e) {
       console.error('[pets] prepare failed:', e.message);
       res.status(500).json({ error: 'prepare failed', detail: e.message });
@@ -289,18 +348,23 @@ export function registerPetRoutes(app, { pool, rpcConnection, requireAuth }) {
       try {
         await client.query('BEGIN');
         await client.query(
-          `INSERT INTO pets (mint, name, ticker, traits, bio, image_url, creator_wallet, launch_signature)
-           VALUES ($1,$2,$3,$4::jsonb,$5,$6,$7,$8)
+          `INSERT INTO pets (mint, name, ticker, traits, bio, image_url, creator_wallet,
+                             launch_signature, pet_wallet_pubkey, pet_wallet_encrypted)
+           VALUES ($1,$2,$3,$4::jsonb,$5,$6,$7,$8,$9,$10)
            ON CONFLICT (mint) DO UPDATE SET
              name = EXCLUDED.name, ticker = EXCLUDED.ticker,
              traits = EXCLUDED.traits, bio = EXCLUDED.bio,
              image_url = COALESCE(EXCLUDED.image_url, pets.image_url),
-             launch_signature = EXCLUDED.launch_signature`,
+             launch_signature = EXCLUDED.launch_signature,
+             pet_wallet_pubkey = COALESCE(EXCLUDED.pet_wallet_pubkey, pets.pet_wallet_pubkey),
+             pet_wallet_encrypted = COALESCE(EXCLUDED.pet_wallet_encrypted, pets.pet_wallet_encrypted)`,
           [
             mint, intent.name, intent.symbol,
             JSON.stringify(intent.traits || []),
             intent.bio || '', imageUrl,
             intent.launcher_wallet, signature,
+            intent.pet_wallet_pubkey || null,
+            intent.pet_wallet_encrypted || null,
           ]
         );
         await client.query(
